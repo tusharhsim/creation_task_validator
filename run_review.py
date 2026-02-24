@@ -18,6 +18,7 @@ Usage:
 
 import argparse
 import asyncio
+import collections
 import csv
 import json
 import os
@@ -68,7 +69,7 @@ API_KEY = os.environ.get(
     "GEMINI_API_KEY"
 )
 DEFAULT_MODEL = "gemini-3.1-pro-preview"
-MAX_API_CONCURRENCY = 10
+MAX_API_CONCURRENCY = 50
 MAX_RETRIES = 3
 REQUEST_TIMEOUT = 120  # seconds per API call
 GIT_TIMEOUT = 300  # seconds per git operation
@@ -105,26 +106,33 @@ class _ProgressBar:
     def __init__(self, total: int):
         self.total = total
         self.done = 0
+        self.in_flight = 0
         self._lock = asyncio.Lock()
-        self._print(f"{'░' * BAR_WIDTH}", "starting...")
+        self._render("waiting...")
 
-    def _print(self, bar: str, label: str):
+    def _render(self, label: str = ""):
         pct = int(100 * self.done / self.total) if self.total else 0
-        print(f"\r  [{bar}] {self.done}/{self.total} ({pct}%) {label}{ERASE_LINE}", end="", flush=True)
+        filled = int(BAR_WIDTH * self.done / self.total) if self.total else 0
+        bar = f"{'█' * filled}{'░' * (BAR_WIDTH - filled)}"
+        flight = f" {YELLOW}{self.in_flight} running{RESET}" if self.in_flight else ""
+        print(f"\r  [{bar}] {self.done}/{self.total} ({pct}%){flight} {label}{ERASE_LINE}", end="", flush=True)
 
     async def wrap(self, coro, name: str):
-        result = await coro
         async with self._lock:
-            self.done += 1
-            filled = int(BAR_WIDTH * self.done / self.total)
-            bar = f"{'█' * filled}{'░' * (BAR_WIDTH - filled)}"
-            self._print(bar, name)
+            self.in_flight += 1
+            self._render(f"{BOLD}+{name}{RESET}")
+        try:
+            result = await coro
+        finally:
+            async with self._lock:
+                self.in_flight -= 1
+                self.done += 1
+                self._render(name)
         return result
 
     def finish(self):
-        filled = "█" * BAR_WIDTH
-        pct = 100
-        print(f"\r  [{filled}] {self.done}/{self.total} ({pct}%) done{ERASE_LINE}")
+        bar = "█" * BAR_WIDTH
+        print(f"\r  [{bar}] {self.done}/{self.total} (100%) done{ERASE_LINE}")
 
 
 # ==========================================
@@ -318,6 +326,7 @@ def clean_json_response(text: str) -> str:
 
 FAIRNESS_CHECKS = [
     ("FLAG_UNFAIR_TEST", FLAG_UNFAIR_TEST, TEST_FILTER_CONSTRUCTS_FILES),
+    # ("TEST_REQ_FILTER", TEST_REQ_FILTER, TEST_FILTER_CONSTRUCTS_FILES),
     ("SCHEMA_VALIDATION", SCHEMA_VALIDATION, SCHEMA_VALIDATION_FILES),
     ("META_FILE_IMPL_LEAK", META_FILE_IMPL_LEAK, META_FILE_IMPL_LEAK_FILES),
     ("SUFFICIENT_REQ_CHECK", SUFFICIENT_REQ_CHECK, SUFFICIENT_REQ_CHECK_FILES),
@@ -681,8 +690,13 @@ async def process_task(
 
     owns_session = session is None
     if owns_session:
-        timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
-        connector = aiohttp.TCPConnector(ssl=SSL_CTX, limit_per_host=MAX_API_CONCURRENCY)
+        timeout = aiohttp.ClientTimeout(
+            total=REQUEST_TIMEOUT, connect=15, sock_connect=10, sock_read=REQUEST_TIMEOUT,
+        )
+        connector = aiohttp.TCPConnector(
+            ssl=SSL_CTX, limit=0, limit_per_host=MAX_API_CONCURRENCY,
+            ttl_dns_cache=300, keepalive_timeout=30,
+        )
         session = aiohttp.ClientSession(connector=connector, timeout=timeout)
 
     sem = asyncio.Semaphore(MAX_API_CONCURRENCY)
@@ -721,28 +735,87 @@ async def process_batch(
     output_dir: str = "./reports",
     model: str = DEFAULT_MODEL,
 ) -> None:
-    """Read CSV and process each task with a shared session."""
+    """Read CSV and process all tasks concurrently."""
     with open(csv_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         rows = list(reader)
 
-    print(f"Batch mode: {len(rows)} task(s) from {csv_path}\n")
+    n_tasks = len(rows)
+    print(f"Batch mode: {n_tasks} task(s) from {csv_path}\n")
 
-    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
-    connector = aiohttp.TCPConnector(ssl=SSL_CTX, limit_per_host=MAX_API_CONCURRENCY)
+    # ── Phase 1: Prepare tasks (git + file read) ──
+    # Per-repo locks prevent concurrent branch checkouts on the same clone.
+    repo_locks = collections.defaultdict(asyncio.Lock)
+
+    async def _prepare(row):
+        user_code, task_code, folder = row["user_code"], row["task_code"], row["folder"]
+        async with repo_locks[user_code]:
+            repo_path = await asyncio.to_thread(clone_or_update_repo, user_code, task_code)
+        all_files, rubric_data = read_task_files(repo_path, folder)
+        schema_valid, schema_messages = run_schema_check(all_files)
+        return {
+            "row": row,
+            "all_files": all_files,
+            "rubric_data": rubric_data,
+            "schema_valid": schema_valid,
+            "schema_messages": schema_messages,
+        }
+
+    print(f"  Preparing {n_tasks} task(s) (git clone/checkout + file read)...")
+    prepared = await asyncio.gather(*[_prepare(row) for row in rows])
+    print(f"  All tasks prepared.\n")
+
+    # ── Phase 2: Run all API checks concurrently ──
+    total_checks = 0
+    for p in prepared:
+        total_checks += len(FAIRNESS_CHECKS)
+        total_checks += sum(1 for cat in ("functional", "robustness", "style") if p["rubric_data"].get(cat))
+
+    print(f"  Running {total_checks} total checks across {n_tasks} task(s)")
+    t0 = time.monotonic()
+
+    timeout = aiohttp.ClientTimeout(
+        total=REQUEST_TIMEOUT, connect=15, sock_connect=10, sock_read=REQUEST_TIMEOUT,
+    )
+    connector = aiohttp.TCPConnector(
+        ssl=SSL_CTX, limit=0, limit_per_host=MAX_API_CONCURRENCY,
+        ttl_dns_cache=300, keepalive_timeout=30,
+    )
+    sem = asyncio.Semaphore(MAX_API_CONCURRENCY)
+    progress = _ProgressBar(total_checks)
+
+    async def _run_checks(p):
+        fairness_res, rubric_res = await asyncio.gather(
+            run_fairness_checks(session, p["all_files"], model, sem, progress),
+            run_rubric_checks(session, p["rubric_data"], model, sem, progress),
+        )
+        return {**p, "fairness_res": fairness_res, "rubric_res": rubric_res}
+
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        for i, row in enumerate(rows, 1):
-            print(f"\n{'=' * 50}")
-            print(f"Task {i}/{len(rows)}")
-            print(f"{'=' * 50}")
-            await process_task(
-                user_code=row["user_code"],
-                task_code=row["task_code"],
-                folder=row["folder"],
-                output_dir=output_dir,
-                model=model,
-                session=session,
-            )
+        results = await asyncio.gather(*[_run_checks(p) for p in prepared])
+
+    progress.finish()
+    elapsed = time.monotonic() - t0
+    print(f"  All checks completed in {elapsed:.1f}s\n")
+
+    # ── Phase 3: Generate reports ──
+    for i, r in enumerate(results, 1):
+        row = r["row"]
+        user_code, folder = row["user_code"], row["folder"]
+
+        print(f"{BOLD}[{i}/{n_tasks}] {user_code} / {folder}{RESET}")
+        print_terminal_summary(r["fairness_res"], r["rubric_res"])
+
+        html = render_html_report(
+            r["fairness_res"], r["rubric_res"],
+            schema_valid=r["schema_valid"],
+            schema_messages=r["schema_messages"],
+            user_code=user_code,
+            folder=folder,
+        )
+        report_path = Path(output_dir) / f"{user_code}_{folder}_report.html"
+        save_report(html, report_path)
+        print(f"  Report saved: {report_path}\n")
 
 
 # ==========================================

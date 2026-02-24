@@ -24,6 +24,7 @@ import os
 import re
 import ssl
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -67,6 +68,10 @@ API_KEY = os.environ.get(
     "GEMINI_API_KEY"
 )
 DEFAULT_MODEL = "gemini-3.1-pro-preview"
+MAX_API_CONCURRENCY = 10
+MAX_RETRIES = 3
+REQUEST_TIMEOUT = 120  # seconds per API call
+GIT_TIMEOUT = 300  # seconds per git operation
 
 # The six task files we read from each task folder
 TASK_FILES = [
@@ -88,10 +93,49 @@ YELLOW = "\033[93m"
 BOLD = "\033[1m"
 RESET = "\033[0m"
 
+_RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+
+ERASE_LINE = "\033[K"
+BAR_WIDTH = 30
+
+
+class _ProgressBar:
+    """In-place terminal progress bar for async tasks."""
+
+    def __init__(self, total: int):
+        self.total = total
+        self.done = 0
+        self._lock = asyncio.Lock()
+        self._print(f"{'░' * BAR_WIDTH}", "starting...")
+
+    def _print(self, bar: str, label: str):
+        pct = int(100 * self.done / self.total) if self.total else 0
+        print(f"\r  [{bar}] {self.done}/{self.total} ({pct}%) {label}{ERASE_LINE}", end="", flush=True)
+
+    async def wrap(self, coro, name: str):
+        result = await coro
+        async with self._lock:
+            self.done += 1
+            filled = int(BAR_WIDTH * self.done / self.total)
+            bar = f"{'█' * filled}{'░' * (BAR_WIDTH - filled)}"
+            self._print(bar, name)
+        return result
+
+    def finish(self):
+        filled = "█" * BAR_WIDTH
+        pct = 100
+        print(f"\r  [{filled}] {self.done}/{self.total} ({pct}%) done{ERASE_LINE}")
+
 
 # ==========================================
 # 1. GIT OPERATIONS (replaces setup_task.sh)
 # ==========================================
+
+
+def _run_git(args: list[str], cwd: str | Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        args, cwd=cwd, check=True, capture_output=True, text=True, timeout=GIT_TIMEOUT,
+    )
 
 
 def clone_or_update_repo(user_code: str, task_code: str, base_dir: str = ".") -> Path:
@@ -102,35 +146,20 @@ def clone_or_update_repo(user_code: str, task_code: str, base_dir: str = ".") ->
 
     if not repo_path.exists():
         print(f"  Cloning {repo_name}...")
-        subprocess.run(
+        _run_git(
             ["git", "clone", f"https://github.com/mercor-code-envs/{repo_name}.git"],
             cwd=base_dir,
-            check=True,
-            capture_output=True,
-            text=True,
         )
 
     print(f"  Checking out {branch}...")
-    subprocess.run(
-        ["git", "checkout", branch],
-        cwd=repo_path,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    subprocess.run(
-        ["git", "pull"],
-        cwd=repo_path,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    _run_git(["git", "checkout", branch], cwd=repo_path)
+    _run_git(["git", "pull"], cwd=repo_path)
 
     return repo_path
 
 
-def read_task_files(repo_path: Path, target_folder: str) -> dict:
-    """Read the 6 task files into a dict matching the notebook's all_files structure."""
+def read_task_files(repo_path: Path, target_folder: str) -> tuple[dict, dict]:
+    """Read the 6 task files. Returns (all_files dict, parsed rubric dict)."""
     full_path = repo_path / "swebench" / "tasks" / target_folder
 
     if not full_path.is_dir():
@@ -146,14 +175,19 @@ def read_task_files(repo_path: Path, target_folder: str) -> dict:
             print(f"  {YELLOW}Warning:{RESET} {rel_path} not found")
 
     # Build the all_files dict the checks expect
-    rubric_dict = json.loads(raw["rubric_json"]) if raw["rubric_json"] else {}
+    try:
+        rubric_dict = json.loads(raw["rubric_json"]) if raw["rubric_json"] else {}
+    except json.JSONDecodeError as e:
+        print(f"  {RED}Error:{RESET} Failed to parse rubric.json: {e}")
+        rubric_dict = {}
+
     all_files = {
         **raw,
         "functional_rubric": rubric_dict.get("functional", []),
         "robustness_rubric": rubric_dict.get("robustness", []),
         "style_rubric": rubric_dict.get("style", []),
     }
-    return all_files
+    return all_files, rubric_dict
 
 
 # ==========================================
@@ -235,24 +269,41 @@ async def get_gemini_response(
     system_prompt: str,
     user_text: str,
     model: str = DEFAULT_MODEL,
+    _semaphore: asyncio.Semaphore | None = None,
 ) -> str:
-    """Call Gemini API. Identical to the notebook's helper."""
+    """Call Gemini API with retry, backoff, and concurrency control."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     headers = {"Content-Type": "application/json", "X-goog-api-key": API_KEY}
     payload = {
         "system_instruction": {"parts": [{"text": system_prompt}]},
         "contents": [{"role": "user", "parts": [{"text": user_text}]}],
     }
-    try:
-        async with session.post(url, headers=headers, json=payload) as resp:
-            if resp.status != 200:
-                return f"Error {resp.status}: {await resp.text()}"
-            data = await resp.json()
-            return data["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError):
-        return "Error: No content generated."
-    except Exception as e:
-        return f"Request Failed: {str(e)}"
+    sem = _semaphore or asyncio.Semaphore(MAX_API_CONCURRENCY)
+    last_error = ""
+
+    for attempt in range(MAX_RETRIES):
+        async with sem:
+            try:
+                async with session.post(url, headers=headers, json=payload) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data["candidates"][0]["content"]["parts"][0]["text"]
+                    body = await resp.text()
+                    last_error = f"Error {resp.status}: {body}"
+                    if resp.status not in _RETRYABLE_STATUSES:
+                        return last_error
+            except (KeyError, IndexError):
+                return "Error: No content generated."
+            except asyncio.TimeoutError:
+                last_error = "Error: Request timed out."
+            except aiohttp.ClientError as e:
+                last_error = f"Request Failed: {e}"
+
+        if attempt < MAX_RETRIES - 1:
+            wait = 2 ** attempt + (attempt * 0.5)
+            await asyncio.sleep(wait)
+
+    return last_error
 
 
 # ==========================================
@@ -265,63 +316,32 @@ def clean_json_response(text: str) -> str:
     return re.sub(r"^```(?:json)?|```$", "", clean, flags=re.MULTILINE).strip()
 
 
-async def run_fairness_checks(
-    session: aiohttp.ClientSession, all_files: dict, model: str = DEFAULT_MODEL
-) -> list[tuple[str, str]]:
-    """Run all 15 fairness checks in parallel."""
-    checks = [
-        ("FLAG_UNFAIR_TEST", FLAG_UNFAIR_TEST, TEST_FILTER_CONSTRUCTS_FILES),
-        ("SCHEMA_VALIDATION", SCHEMA_VALIDATION, SCHEMA_VALIDATION_FILES),
-        ("META_FILE_IMPL_LEAK", META_FILE_IMPL_LEAK, META_FILE_IMPL_LEAK_FILES),
-        ("SUFFICIENT_REQ_CHECK", SUFFICIENT_REQ_CHECK, SUFFICIENT_REQ_CHECK_FILES),
-        ("META_FILES_ALIGNMENT", META_FILES_ALIGNMENT, META_FILES_ALIGNMENT_FILES),
-        (
-            "PROBLEM_STATEMENT_TEST_ALIGNMENT",
-            PROBLEM_STATEMENT_TEST_ALIGNMENT,
-            PROBLEM_STATEMENT_TEST_ALIGNMENT_FILES,
-        ),
-        (
-            "REQUIREMENTS_TEST_ALIGNMENT",
-            REQUIREMENTS_TEST_ALIGNMENT,
-            REQUIREMENTS_TEST_ALIGNMENT_FILES,
-        ),
-        (
-            "REQUIREMENTS_INTERFACE_ALIGNMENT",
-            REQUIREMENTS_INTERFACE_ALIGNMENT,
-            REQUIREMENTS_INTERFACE_ALIGNMENT_FILES,
-        ),
-        (
-            "FUNCTIONAL_RUBRIC_ALIGNMENT",
-            RUBRIC_ALIGNMENT,
-            FUNCTIONAL_RUBRIC_ALIGNMENT_FILES,
-        ),
-        (
-            "ROBUSTNESS_RUBRIC_ALIGNMENT",
-            RUBRIC_ALIGNMENT,
-            ROBUSTNESS_RUBRIC_ALIGNMENT_FILES,
-        ),
-        (
-            "FUNCTIONAL_RUBRIC_VALIDATION",
-            RUBRIC_VALIDATION,
-            FUNCTIONAL_RUBRIC_VALIDATION_FILES,
-        ),
-        (
-            "ROBUSTNESS_RUBRIC_VALIDATION",
-            RUBRIC_VALIDATION,
-            ROBUSTNESS_RUBRIC_VALIDATION_FILES,
-        ),
-        (
-            "STYLE_RUBRIC_VALIDATION",
-            RUBRIC_VALIDATION,
-            STYLE_RUBRIC_VALIDATION_FILES,
-        ),
-        (
-            "TEST_FILTER_CONSTRUCTS",
-            TEST_FILTER_CONSTRUCTS,
-            TEST_FILTER_CONSTRUCTS_FILES,
-        ),
-    ]
+FAIRNESS_CHECKS = [
+    ("FLAG_UNFAIR_TEST", FLAG_UNFAIR_TEST, TEST_FILTER_CONSTRUCTS_FILES),
+    ("SCHEMA_VALIDATION", SCHEMA_VALIDATION, SCHEMA_VALIDATION_FILES),
+    ("META_FILE_IMPL_LEAK", META_FILE_IMPL_LEAK, META_FILE_IMPL_LEAK_FILES),
+    ("SUFFICIENT_REQ_CHECK", SUFFICIENT_REQ_CHECK, SUFFICIENT_REQ_CHECK_FILES),
+    ("META_FILES_ALIGNMENT", META_FILES_ALIGNMENT, META_FILES_ALIGNMENT_FILES),
+    ("PROBLEM_STATEMENT_TEST_ALIGNMENT", PROBLEM_STATEMENT_TEST_ALIGNMENT, PROBLEM_STATEMENT_TEST_ALIGNMENT_FILES),
+    ("REQUIREMENTS_TEST_ALIGNMENT", REQUIREMENTS_TEST_ALIGNMENT, REQUIREMENTS_TEST_ALIGNMENT_FILES),
+    ("REQUIREMENTS_INTERFACE_ALIGNMENT", REQUIREMENTS_INTERFACE_ALIGNMENT, REQUIREMENTS_INTERFACE_ALIGNMENT_FILES),
+    ("FUNCTIONAL_RUBRIC_ALIGNMENT", RUBRIC_ALIGNMENT, FUNCTIONAL_RUBRIC_ALIGNMENT_FILES),
+    ("ROBUSTNESS_RUBRIC_ALIGNMENT", RUBRIC_ALIGNMENT, ROBUSTNESS_RUBRIC_ALIGNMENT_FILES),
+    ("FUNCTIONAL_RUBRIC_VALIDATION", RUBRIC_VALIDATION, FUNCTIONAL_RUBRIC_VALIDATION_FILES),
+    ("ROBUSTNESS_RUBRIC_VALIDATION", RUBRIC_VALIDATION, ROBUSTNESS_RUBRIC_VALIDATION_FILES),
+    ("STYLE_RUBRIC_VALIDATION", RUBRIC_VALIDATION, STYLE_RUBRIC_VALIDATION_FILES),
+    ("TEST_FILTER_CONSTRUCTS", TEST_FILTER_CONSTRUCTS, TEST_FILTER_CONSTRUCTS_FILES),
+]
 
+
+async def run_fairness_checks(
+    session: aiohttp.ClientSession,
+    all_files: dict,
+    model: str = DEFAULT_MODEL,
+    _semaphore: asyncio.Semaphore | None = None,
+    _progress: _ProgressBar | None = None,
+) -> list[tuple[str, str]]:
+    """Run all fairness checks in parallel with concurrency control."""
     # Format template values — rubric sub-categories need JSON serialization
     fmt_files = dict(all_files)
     for key in ("functional_rubric", "robustness_rubric", "style_rubric"):
@@ -329,11 +349,10 @@ async def run_fairness_checks(
             fmt_files[key] = json.dumps(fmt_files[key], indent=2)
 
     names, coros = [], []
-    for name, si, files_tpl in checks:
+    for name, si, files_tpl in FAIRNESS_CHECKS:
         names.append(name)
-        coros.append(
-            get_gemini_response(session, si, files_tpl.format(**fmt_files), model)
-        )
+        coro = get_gemini_response(session, si, files_tpl.format(**fmt_files), model, _semaphore)
+        coros.append(_progress.wrap(coro, name) if _progress else coro)
 
     responses = await asyncio.gather(*coros)
     return list(zip(names, responses))
@@ -343,6 +362,8 @@ async def run_rubric_checks(
     session: aiohttp.ClientSession,
     rubric_data: dict,
     model: str = DEFAULT_MODEL,
+    _semaphore: asyncio.Semaphore | None = None,
+    _progress: _ProgressBar | None = None,
 ) -> list[tuple[str, str]]:
     """Run per-category rubric compliance checks."""
     categories = ["functional", "robustness", "style"]
@@ -357,7 +378,8 @@ async def run_rubric_checks(
             "Here's the file you need to validate:\n\n"
             f"<rubrics>\n{json.dumps(items, indent=2)}\n</rubrics>"
         )
-        coros.append(get_gemini_response(session, PROMPTS[cat], payload, model))
+        coro = get_gemini_response(session, PROMPTS[cat], payload, model, _semaphore)
+        coros.append(_progress.wrap(coro, f"{cat}_rubric") if _progress else coro)
 
     responses = await asyncio.gather(*coros)
     return list(zip(active, responses))
@@ -636,40 +658,47 @@ async def process_task(
     folder: str,
     output_dir: str = "./reports",
     model: str = DEFAULT_MODEL,
+    session: aiohttp.ClientSession | None = None,
 ) -> None:
     """Full pipeline for one task."""
     print(f"\n{BOLD}Processing: {user_code} / {folder}{RESET}")
 
-    # Step 1: Git operations
-    repo_path = clone_or_update_repo(user_code, task_code)
+    # Step 1: Git operations (run in thread to avoid blocking the event loop)
+    repo_path = await asyncio.to_thread(clone_or_update_repo, user_code, task_code)
 
-    # Step 2: Read files
-    all_files = read_task_files(repo_path, folder)
+    # Step 2: Read files (returns parsed rubric_data to avoid re-parsing)
+    all_files, rubric_data = read_task_files(repo_path, folder)
 
     # Step 3: Schema check
     schema_valid, schema_messages = run_schema_check(all_files)
 
     # Step 4: Run all checks
-    rubric_data = (
-        json.loads(all_files["rubric_json"])
-        if isinstance(all_files["rubric_json"], str)
-        else all_files["rubric_json"]
-    )
-
-    n_fairness = 14
+    n_fairness = len(FAIRNESS_CHECKS)
     n_rubric = sum(1 for cat in ("functional", "robustness", "style") if rubric_data.get(cat))
-    print(f"\n  Running {n_fairness} fairness checks + {n_rubric} rubric checks...")
+    total_checks = n_fairness + n_rubric
+    print(f"\n  Running {n_fairness} fairness + {n_rubric} rubric = {total_checks} checks")
     t0 = time.monotonic()
 
-    connector = aiohttp.TCPConnector(ssl=SSL_CTX)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        fairness_res, rubric_res = await asyncio.gather(
-            run_fairness_checks(session, all_files, model),
-            run_rubric_checks(session, rubric_data, model),
-        )
+    owns_session = session is None
+    if owns_session:
+        timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+        connector = aiohttp.TCPConnector(ssl=SSL_CTX, limit_per_host=MAX_API_CONCURRENCY)
+        session = aiohttp.ClientSession(connector=connector, timeout=timeout)
 
+    sem = asyncio.Semaphore(MAX_API_CONCURRENCY)
+    progress = _ProgressBar(total_checks)
+    try:
+        fairness_res, rubric_res = await asyncio.gather(
+            run_fairness_checks(session, all_files, model, sem, progress),
+            run_rubric_checks(session, rubric_data, model, sem, progress),
+        )
+    finally:
+        if owns_session:
+            await session.close()
+
+    progress.finish()
     elapsed = time.monotonic() - t0
-    print(f"  Done in {elapsed:.1f}s")
+    print(f"  Completed in {elapsed:.1f}s")
 
     # Step 5: Terminal summary
     print_terminal_summary(fairness_res, rubric_res)
@@ -692,24 +721,28 @@ async def process_batch(
     output_dir: str = "./reports",
     model: str = DEFAULT_MODEL,
 ) -> None:
-    """Read CSV and process each task sequentially."""
+    """Read CSV and process each task with a shared session."""
     with open(csv_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         rows = list(reader)
 
     print(f"Batch mode: {len(rows)} task(s) from {csv_path}\n")
 
-    for i, row in enumerate(rows, 1):
-        print(f"\n{'=' * 50}")
-        print(f"Task {i}/{len(rows)}")
-        print(f"{'=' * 50}")
-        await process_task(
-            user_code=row["user_code"],
-            task_code=row["task_code"],
-            folder=row["folder"],
-            output_dir=output_dir,
-            model=model,
-        )
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+    connector = aiohttp.TCPConnector(ssl=SSL_CTX, limit_per_host=MAX_API_CONCURRENCY)
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        for i, row in enumerate(rows, 1):
+            print(f"\n{'=' * 50}")
+            print(f"Task {i}/{len(rows)}")
+            print(f"{'=' * 50}")
+            await process_task(
+                user_code=row["user_code"],
+                task_code=row["task_code"],
+                folder=row["folder"],
+                output_dir=output_dir,
+                model=model,
+                session=session,
+            )
 
 
 # ==========================================
@@ -753,6 +786,10 @@ def main():
         parser.error("Provide either --user-code/--task-code/--folder or --batch.")
     if has_single and not all(single_task_args):
         parser.error("--user-code, --task-code, and --folder are all required together.")
+
+    if not API_KEY:
+        print(f"{RED}Error:{RESET} GEMINI_API_KEY environment variable is not set.", file=sys.stderr)
+        sys.exit(1)
 
     if has_batch:
         asyncio.run(process_batch(args.batch, args.output_dir, args.model))

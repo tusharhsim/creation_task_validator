@@ -373,8 +373,7 @@ You must evaluate every single rubric item against the following **4 Fatal Flaws
 
 **4. violation: IMPLEMENTATION_LEAK**
 * **Rule:** Focus on observable outcomes, not private implementation details.
-* **Flag if:** The rubric dictates specific internal logic or code structure rather than the result.
-* **Constraint:** Flag references to obscure helper functions or strict internal variable naming unless it is a specific refactoring task.
+* **Flag if:** The rubric mentions any specific function name, class name, method name, variable name, or module name. Rubrics must evaluate observable behaviors and external outcomes—not the code identifiers or internal structures used to produce them.
 
 ---
 
@@ -666,7 +665,6 @@ Return ONLY a valid JSON array.
   }
 ]
 """,
-
     "robustness": """You are a Reliability Engineer. Your task is to validate a list of rubric criteria to ensure they strictly fall under the "Robustness" category definition provided below.
 
 **CATEGORY DEFINITION: ROBUSTNESS**
@@ -701,7 +699,6 @@ Return ONLY a valid JSON array.
   }
 ]
 """,
-
     "style": """You are a Code Standard Reviewer. Your task is to validate a list of rubric criteria to ensure they strictly fall under the "Style" category definition provided below.
 
 **CATEGORY DEFINITION: STYLE**
@@ -738,5 +735,5 @@ Return ONLY a valid JSON array.
     "proposed_fix": "Revised text that resolves the issue while maintaining the original intent"
   }
 ]
-"""
+""",
 }

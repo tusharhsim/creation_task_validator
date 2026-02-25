@@ -32,6 +32,9 @@ from pathlib import Path
 
 import aiohttp
 import certifi
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from prompts import (
     TEST_FILTER_CONSTRUCTS,
@@ -65,9 +68,7 @@ from prompts import (
 # CONFIG
 # ==========================================
 
-API_KEY = os.environ.get(
-    "GEMINI_API_KEY"
-)
+API_KEY = os.environ.get("GEMINI_API_KEY")
 DEFAULT_MODEL = "gemini-3.1-pro-preview"
 MAX_API_CONCURRENCY = 50
 MAX_RETRIES = 3
@@ -115,7 +116,11 @@ class _ProgressBar:
         filled = int(BAR_WIDTH * self.done / self.total) if self.total else 0
         bar = f"{'█' * filled}{'░' * (BAR_WIDTH - filled)}"
         flight = f" {YELLOW}{self.in_flight} running{RESET}" if self.in_flight else ""
-        print(f"\r  [{bar}] {self.done}/{self.total} ({pct}%){flight} {label}{ERASE_LINE}", end="", flush=True)
+        print(
+            f"\r  [{bar}] {self.done}/{self.total} ({pct}%){flight} {label}{ERASE_LINE}",
+            end="",
+            flush=True,
+        )
 
     async def wrap(self, coro, name: str):
         async with self._lock:
@@ -142,7 +147,12 @@ class _ProgressBar:
 
 def _run_git(args: list[str], cwd: str | Path) -> subprocess.CompletedProcess:
     return subprocess.run(
-        args, cwd=cwd, check=True, capture_output=True, text=True, timeout=GIT_TIMEOUT,
+        args,
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=GIT_TIMEOUT,
     )
 
 
@@ -308,7 +318,7 @@ async def get_gemini_response(
                 last_error = f"Request Failed: {e}"
 
         if attempt < MAX_RETRIES - 1:
-            wait = 2 ** attempt + (attempt * 0.5)
+            wait = 2**attempt + (attempt * 0.5)
             await asyncio.sleep(wait)
 
     return last_error
@@ -331,13 +341,41 @@ FAIRNESS_CHECKS = [
     ("META_FILE_IMPL_LEAK", META_FILE_IMPL_LEAK, META_FILE_IMPL_LEAK_FILES),
     ("SUFFICIENT_REQ_CHECK", SUFFICIENT_REQ_CHECK, SUFFICIENT_REQ_CHECK_FILES),
     ("META_FILES_ALIGNMENT", META_FILES_ALIGNMENT, META_FILES_ALIGNMENT_FILES),
-    ("PROBLEM_STATEMENT_TEST_ALIGNMENT", PROBLEM_STATEMENT_TEST_ALIGNMENT, PROBLEM_STATEMENT_TEST_ALIGNMENT_FILES),
-    ("REQUIREMENTS_TEST_ALIGNMENT", REQUIREMENTS_TEST_ALIGNMENT, REQUIREMENTS_TEST_ALIGNMENT_FILES),
-    ("REQUIREMENTS_INTERFACE_ALIGNMENT", REQUIREMENTS_INTERFACE_ALIGNMENT, REQUIREMENTS_INTERFACE_ALIGNMENT_FILES),
-    ("FUNCTIONAL_RUBRIC_ALIGNMENT", RUBRIC_ALIGNMENT, FUNCTIONAL_RUBRIC_ALIGNMENT_FILES),
-    ("ROBUSTNESS_RUBRIC_ALIGNMENT", RUBRIC_ALIGNMENT, ROBUSTNESS_RUBRIC_ALIGNMENT_FILES),
-    ("FUNCTIONAL_RUBRIC_VALIDATION", RUBRIC_VALIDATION, FUNCTIONAL_RUBRIC_VALIDATION_FILES),
-    ("ROBUSTNESS_RUBRIC_VALIDATION", RUBRIC_VALIDATION, ROBUSTNESS_RUBRIC_VALIDATION_FILES),
+    (
+        "PROBLEM_STATEMENT_TEST_ALIGNMENT",
+        PROBLEM_STATEMENT_TEST_ALIGNMENT,
+        PROBLEM_STATEMENT_TEST_ALIGNMENT_FILES,
+    ),
+    (
+        "REQUIREMENTS_TEST_ALIGNMENT",
+        REQUIREMENTS_TEST_ALIGNMENT,
+        REQUIREMENTS_TEST_ALIGNMENT_FILES,
+    ),
+    (
+        "REQUIREMENTS_INTERFACE_ALIGNMENT",
+        REQUIREMENTS_INTERFACE_ALIGNMENT,
+        REQUIREMENTS_INTERFACE_ALIGNMENT_FILES,
+    ),
+    (
+        "FUNCTIONAL_RUBRIC_ALIGNMENT",
+        RUBRIC_ALIGNMENT,
+        FUNCTIONAL_RUBRIC_ALIGNMENT_FILES,
+    ),
+    (
+        "ROBUSTNESS_RUBRIC_ALIGNMENT",
+        RUBRIC_ALIGNMENT,
+        ROBUSTNESS_RUBRIC_ALIGNMENT_FILES,
+    ),
+    (
+        "FUNCTIONAL_RUBRIC_VALIDATION",
+        RUBRIC_VALIDATION,
+        FUNCTIONAL_RUBRIC_VALIDATION_FILES,
+    ),
+    (
+        "ROBUSTNESS_RUBRIC_VALIDATION",
+        RUBRIC_VALIDATION,
+        ROBUSTNESS_RUBRIC_VALIDATION_FILES,
+    ),
     ("STYLE_RUBRIC_VALIDATION", RUBRIC_VALIDATION, STYLE_RUBRIC_VALIDATION_FILES),
     ("TEST_FILTER_CONSTRUCTS", TEST_FILTER_CONSTRUCTS, TEST_FILTER_CONSTRUCTS_FILES),
 ]
@@ -360,7 +398,9 @@ async def run_fairness_checks(
     names, coros = [], []
     for name, si, files_tpl in FAIRNESS_CHECKS:
         names.append(name)
-        coro = get_gemini_response(session, si, files_tpl.format(**fmt_files), model, _semaphore)
+        coro = get_gemini_response(
+            session, si, files_tpl.format(**fmt_files), model, _semaphore
+        )
         coros.append(_progress.wrap(coro, name) if _progress else coro)
 
     responses = await asyncio.gather(*coros)
@@ -501,7 +541,9 @@ def render_html_report(
     if user_code:
         h += f'<span><span class="label">User:</span> <strong>{user_code}</strong></span>'
     if folder:
-        h += f'<span><span class="label">Folder:</span> <strong>{folder}</strong></span>'
+        h += (
+            f'<span><span class="label">Folder:</span> <strong>{folder}</strong></span>'
+        )
     h += f'<span><span class="label">Generated:</span> {timestamp}</span>'
     h += "</div>\n"
 
@@ -543,9 +585,7 @@ def render_html_report(
             if not isinstance(items, list):
                 raise ValueError("Expected a JSON array")
 
-            n_pass = sum(
-                1 for x in items if str(x.get("status", "")).upper() == "PASS"
-            )
+            n_pass = sum(1 for x in items if str(x.get("status", "")).upper() == "PASS")
             n_total = len(items)
             h += (
                 '<div class="summary-bar">'
@@ -629,9 +669,7 @@ def print_terminal_summary(
     for category, raw_json in rubric_results:
         try:
             items = json.loads(clean_json_response(raw_json))
-            n_pass = sum(
-                1 for x in items if str(x.get("status", "")).upper() == "PASS"
-            )
+            n_pass = sum(1 for x in items if str(x.get("status", "")).upper() == "PASS")
             n_total = len(items)
             color = GREEN if n_pass == n_total else RED
             print(f"  {color}{n_pass}/{n_total}{RESET}  {category.capitalize()}")
@@ -683,19 +721,29 @@ async def process_task(
 
     # Step 4: Run all checks
     n_fairness = len(FAIRNESS_CHECKS)
-    n_rubric = sum(1 for cat in ("functional", "robustness", "style") if rubric_data.get(cat))
+    n_rubric = sum(
+        1 for cat in ("functional", "robustness", "style") if rubric_data.get(cat)
+    )
     total_checks = n_fairness + n_rubric
-    print(f"\n  Running {n_fairness} fairness + {n_rubric} rubric = {total_checks} checks")
+    print(
+        f"\n  Running {n_fairness} fairness + {n_rubric} rubric = {total_checks} checks"
+    )
     t0 = time.monotonic()
 
     owns_session = session is None
     if owns_session:
         timeout = aiohttp.ClientTimeout(
-            total=REQUEST_TIMEOUT, connect=15, sock_connect=10, sock_read=REQUEST_TIMEOUT,
+            total=REQUEST_TIMEOUT,
+            connect=15,
+            sock_connect=10,
+            sock_read=REQUEST_TIMEOUT,
         )
         connector = aiohttp.TCPConnector(
-            ssl=SSL_CTX, limit=0, limit_per_host=MAX_API_CONCURRENCY,
-            ttl_dns_cache=300, keepalive_timeout=30,
+            ssl=SSL_CTX,
+            limit=0,
+            limit_per_host=MAX_API_CONCURRENCY,
+            ttl_dns_cache=300,
+            keepalive_timeout=30,
         )
         session = aiohttp.ClientSession(connector=connector, timeout=timeout)
 
@@ -719,7 +767,8 @@ async def process_task(
 
     # Step 6: HTML report
     html = render_html_report(
-        fairness_res, rubric_res,
+        fairness_res,
+        rubric_res,
         schema_valid=schema_valid,
         schema_messages=schema_messages,
         user_code=user_code,
@@ -750,7 +799,9 @@ async def process_batch(
     async def _prepare(row):
         user_code, task_code, folder = row["user_code"], row["task_code"], row["folder"]
         async with repo_locks[user_code]:
-            repo_path = await asyncio.to_thread(clone_or_update_repo, user_code, task_code)
+            repo_path = await asyncio.to_thread(
+                clone_or_update_repo, user_code, task_code
+            )
         all_files, rubric_data = read_task_files(repo_path, folder)
         schema_valid, schema_messages = run_schema_check(all_files)
         return {
@@ -769,17 +820,27 @@ async def process_batch(
     total_checks = 0
     for p in prepared:
         total_checks += len(FAIRNESS_CHECKS)
-        total_checks += sum(1 for cat in ("functional", "robustness", "style") if p["rubric_data"].get(cat))
+        total_checks += sum(
+            1
+            for cat in ("functional", "robustness", "style")
+            if p["rubric_data"].get(cat)
+        )
 
     print(f"  Running {total_checks} total checks across {n_tasks} task(s)")
     t0 = time.monotonic()
 
     timeout = aiohttp.ClientTimeout(
-        total=REQUEST_TIMEOUT, connect=15, sock_connect=10, sock_read=REQUEST_TIMEOUT,
+        total=REQUEST_TIMEOUT,
+        connect=15,
+        sock_connect=10,
+        sock_read=REQUEST_TIMEOUT,
     )
     connector = aiohttp.TCPConnector(
-        ssl=SSL_CTX, limit=0, limit_per_host=MAX_API_CONCURRENCY,
-        ttl_dns_cache=300, keepalive_timeout=30,
+        ssl=SSL_CTX,
+        limit=0,
+        limit_per_host=MAX_API_CONCURRENCY,
+        ttl_dns_cache=300,
+        keepalive_timeout=30,
     )
     sem = asyncio.Semaphore(MAX_API_CONCURRENCY)
     progress = _ProgressBar(total_checks)
@@ -807,7 +868,8 @@ async def process_batch(
         print_terminal_summary(r["fairness_res"], r["rubric_res"])
 
         html = render_html_report(
-            r["fairness_res"], r["rubric_res"],
+            r["fairness_res"],
+            r["rubric_res"],
             schema_valid=r["schema_valid"],
             schema_messages=r["schema_messages"],
             user_code=user_code,
@@ -840,10 +902,14 @@ def main():
 
     # Options
     parser.add_argument(
-        "--output-dir", default="./reports", help="Output directory for HTML reports (default: ./reports)"
+        "--output-dir",
+        default="./reports",
+        help="Output directory for HTML reports (default: ./reports)",
     )
     parser.add_argument(
-        "--model", default=DEFAULT_MODEL, help=f"Gemini model to use (default: {DEFAULT_MODEL})"
+        "--model",
+        default=DEFAULT_MODEL,
+        help=f"Gemini model to use (default: {DEFAULT_MODEL})",
     )
 
     args = parser.parse_args()
@@ -858,17 +924,24 @@ def main():
     if not has_single and not has_batch:
         parser.error("Provide either --user-code/--task-code/--folder or --batch.")
     if has_single and not all(single_task_args):
-        parser.error("--user-code, --task-code, and --folder are all required together.")
+        parser.error(
+            "--user-code, --task-code, and --folder are all required together."
+        )
 
     if not API_KEY:
-        print(f"{RED}Error:{RESET} GEMINI_API_KEY environment variable is not set.", file=sys.stderr)
+        print(
+            f"{RED}Error:{RESET} GEMINI_API_KEY environment variable is not set.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     if has_batch:
         asyncio.run(process_batch(args.batch, args.output_dir, args.model))
     else:
         asyncio.run(
-            process_task(args.user_code, args.task_code, args.folder, args.output_dir, args.model)
+            process_task(
+                args.user_code, args.task_code, args.folder, args.output_dir, args.model
+            )
         )
 
 
